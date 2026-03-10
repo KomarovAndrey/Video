@@ -135,10 +135,46 @@ def analyze_video(
 def _crop_to_face_or_person(frame: "cv2.Mat", bbox: Tuple[int, int, int, int], pad: int = 20) -> "cv2.Mat":
     """
     Вырезает область для превью: по возможности по лицу, иначе по верхней части человека (голова/плечи).
-    Детектор людей (HOG) даёт bbox на всё тело — без детекции лиц кадр часто без лица или с фоном.
+
+    Улучшенный алгоритм:
+    - сначала ищет лица на всём кадре и выбирает то, чей центр ближе всего к центру bbox трека;
+    - если не нашёл — использует старое поведение (верхняя часть bbox).
     """
     x, y, w, h = bbox
     H, W = frame.shape[0], frame.shape[1]
+
+    # 1. Попытаться найти лицо по всему кадру и выбрать ближайшее к треку.
+    gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    faces = face_cascade.detectMultiScale(
+        gray_full, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+    )
+    if len(faces) > 0:
+        cx_track = x + w / 2.0
+        cy_track = y + h / 3.0  # чуть выше центра, ближе к голове
+        best_face = None
+        best_dist = None
+        for (fx, fy, fw, fh) in faces:
+            cx_face = fx + fw / 2.0
+            cy_face = fy + fh / 2.0
+            dist = (cx_face - cx_track) ** 2 + (cy_face - cy_track) ** 2
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_face = (fx, fy, fw, fh)
+        if best_face is not None:
+            fx, fy, fw, fh = best_face
+            face_pad = 20
+            fx1 = max(0, fx - face_pad)
+            fy1 = max(0, fy - face_pad)
+            fx2 = min(W, fx + fw + face_pad)
+            fy2 = min(H, fy + fh + face_pad)
+            crop = frame[fy1:fy2, fx1:fx2]
+            if crop.size > 0:
+                return crop
+
+    # 2. Фоллбек: вырезаем окрестность around bbox, как раньше.
     x1 = max(0, x - pad)
     y1 = max(0, y - pad)
     x2 = min(W, x + w + pad)
@@ -146,21 +182,7 @@ def _crop_to_face_or_person(frame: "cv2.Mat", bbox: Tuple[int, int, int, int], p
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         return frame[y1:y2, x1:x2]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    if len(faces) > 0:
-        # Берём самое большое лицо
-        fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
-        face_pad = 15
-        fx1 = max(0, fx - face_pad)
-        fy1 = max(0, fy - face_pad)
-        fx2 = min(roi.shape[1], fx + fw + face_pad)
-        fy2 = min(roi.shape[0], fy + fh + face_pad)
-        crop = roi[fy1:fy2, fx1:fx2]
-        if crop.size > 0:
-            return crop
-    # Лицо не найдено: вырезаем верхнюю часть bbox (голова/плечи), а не ноги/фон
+
     head_h = max(h // 2, min(120, h))
     y2_head = min(H, y + head_h + pad)
     crop = frame[y1:y2_head, x1:x2]
