@@ -1,5 +1,5 @@
 streamlit
-opencv-python-headless==4.10.0.84
+opencv-python-headless
 ffmpeg-python
 whisper-timestamped
 pandas
@@ -8,7 +8,7 @@ joblib
 numpy
 torch
 fer
-
+face-recognition
 
 opencv-contrib-python>=4.9.0
 numpy>=1.26.0

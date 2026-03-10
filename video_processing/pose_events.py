@@ -13,7 +13,7 @@ from __future__ import annotations
 """
 
 from collections import defaultdict
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -35,23 +35,24 @@ def _per_track_detections(
 
 def build_video_segments_from_tracks(
     tracked: List[TrackedDetection],
+    track_id_to_identity: Optional[Dict[int, str]] = None,
 ) -> List[VideoActivitySegment]:
     """
     Строит список VideoActivitySegment на основе треков.
 
-    Сейчас:
-    - is_off_task заполняется на основе compute_track_video_stats (как раньше);
-    - is_hand_raised помечается эвристически:
-      если верх bbox заметно выше медианного положения трека,
-      что может соответствовать вставанию/поднятию руки.
-
-    В будущем сюда можно добавить настоящую позу и ориентацию.
+    Если передан track_id_to_identity (track_id -> identity_id), то student_id в сегментах
+    задаётся по лицу: несколько треков одного человека получают один identity_id.
     """
     if not tracked:
         return []
 
     track_stats = compute_track_video_stats(tracked)
     by_track = _per_track_detections(tracked)
+
+    def _student_id(det: TrackedDetection) -> str:
+        if track_id_to_identity:
+            return track_id_to_identity.get(det.track_id, str(det.track_id))
+        return str(det.track_id)
 
     segments: List[VideoActivitySegment] = []
 
@@ -67,19 +68,15 @@ def build_video_segments_from_tracks(
         stats = track_stats.get(track_id)
         for det in dets:
             x, y, w, h = det.bbox
-            # эвристика: если объект выше среднего, считаем, что ученик "поднялся"
-            # (возможное поднятие руки/вставание).
             is_hand_raised = bool(median_h > 0 and y < y_threshold)
-
             is_off_task = False
             if stats is not None:
                 is_off_task = bool(
                     stats.motion_intensity > 0.7 and stats.lateral_motion_ratio > 0.6
                 )
-
             segments.append(
                 VideoActivitySegment(
-                    student_id=str(track_id),
+                    student_id=_student_id(det),
                     start=det.timestamp,
                     end=det.timestamp,
                     is_hand_raised=is_hand_raised,

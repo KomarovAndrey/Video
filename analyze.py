@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -17,12 +17,13 @@ from video_processing import iter_frames, track_students_simple
 from video_processing.tracking import TrackedDetection
 from video_processing.pose_events import build_video_segments_from_tracks
 from video_processing.emotion import estimate_facial_engagement_per_track
+from video_processing.identity_lbph import get_track_id_to_identity_lbph
 
 
 def analyze_video(
     video_path: str | Path,
     work_dir: str | Path | None = None,
-    min_track_segments: int = 30,
+    min_track_segments: int = 20,
 ) -> tuple[Rubric, Dict[str, StudentFeatures], Dict[str, StudentScores], Dict[str, str], Dict[str, TrackFrameBbox], Dict[str, bytes]]:
     """
     Полный анализ видео:
@@ -39,8 +40,16 @@ def analyze_video(
     frame_iter = iter_frames(video_path)
     tracked = track_students_simple(frame_iter)
 
-    # Видео-события: эвристики по трекам (поднятая рука, оффтоп и т.п.).
-    video_segments: List[VideoActivitySegment] = build_video_segments_from_tracks(tracked)
+    # Слияние треков по лицу (LBPH, без dlib): один человек = один identity_id.
+    track_id_to_identity: Dict[int, str] = get_track_id_to_identity_lbph(
+        video_path,
+        tracked,
+    )
+
+    # Видео-события: эвристики по трекам (поднятая рука, оффтоп). student_id = identity_id.
+    video_segments: List[VideoActivitySegment] = build_video_segments_from_tracks(
+        tracked, track_id_to_identity=track_id_to_identity
+    )
 
     # Аудио и ASR.
     audio_dir = work_dir / "audio"
@@ -59,20 +68,21 @@ def analyze_video(
         video_segments=video_segments,
     )
 
+    # Один представительный кадр на identity (по самому длинному треку).
+    identity_id_to_frame_bbox: Dict[str, TrackFrameBbox] = {}
+    identity_to_track_ids: Dict[str, List[int]] = defaultdict(list)
+    for tid, iid in track_id_to_identity.items():
+        identity_to_track_ids[iid].append(tid)
+    for identity_id, tids in identity_to_track_ids.items():
+        # выбираем трек с максимальным числом детекций
+        best_tid = max(tids, key=lambda t: sum(1 for d in tracked if d.track_id == t))
+        for d in tracked:
+            if d.track_id == best_tid:
+                identity_id_to_frame_bbox[identity_id] = (d.frame_index, d.bbox)
+                break
+
     # Оценка вовлечённости по мимике (если доступна модель FER).
-    # Используем те же кадры, что и для превью по трекам.
-    # Для экономии ресурсов берём по одному кадру на трек.
-    track_id_to_frame_bbox: Dict[str, TrackFrameBbox] = {}
-    for seg in video_segments:
-        # запомним один из кадров для каждого трека
-        if seg.student_id not in track_id_to_frame_bbox:
-            tid_int = int(seg.student_id) if seg.student_id.isdigit() else None
-            if tid_int is not None:
-                # найдём соответствующий detection
-                for d in tracked:
-                    if d.track_id == tid_int:
-                        track_id_to_frame_bbox[seg.student_id] = (d.frame_index, d.bbox)
-                        break
+    track_id_to_frame_bbox = identity_id_to_frame_bbox
 
     # Предзагружаем несколько кадров по сохранённым индексам.
     video_frames: List[Tuple[int, "cv2.Mat"]] = []
@@ -122,24 +132,30 @@ def analyze_video(
     features_labeled = {id_to_label[k]: student_features[k] for k in sorted_ids}
     scores_labeled = {id_to_label[k]: student_scores[k] for k in sorted_ids}
 
-    # Превью по трекам: кадр + JPEG-байты, чтобы в UI сразу показывать фото без открытия видео.
+    # Превью: один кадр на identity (уже в identity_id_to_frame_bbox).
     label_to_track_id: Dict[str, str] = {id_to_label[sid]: sid for sid in sorted_ids}
-    # используем уже собранные кадры для engagement; при отсутствии — рассчитываем как раньше
-    full_track_id_to_frame_bbox: Dict[str, TrackFrameBbox] = dict(track_id_to_frame_bbox)
+    full_track_id_to_frame_bbox: Dict[str, TrackFrameBbox] = dict(identity_id_to_frame_bbox)
     for sid in sorted_ids:
-        if sid in full_track_id_to_frame_bbox:
-            continue
-        tid = int(sid) if (isinstance(sid, str) and sid.isdigit()) else None
-        if tid is None:
-            continue
-        dets = [(d.frame_index, d.bbox) for d in tracked if d.track_id == tid]
-        if dets:
-            mid = len(dets) // 2
-            full_track_id_to_frame_bbox[sid] = dets[mid]
+        if sid not in full_track_id_to_frame_bbox:
+            tid = int(sid) if (isinstance(sid, str) and sid.isdigit()) else None
+            if tid is not None:
+                dets = [(d.frame_index, d.bbox) for d in tracked if d.track_id == tid]
+                if dets:
+                    mid = len(dets) // 2
+                    full_track_id_to_frame_bbox[sid] = dets[mid]
     track_id_to_image_bytes: Dict[str, bytes] = _crop_frames_to_jpeg_bytes(
-        video_path, list(full_track_id_to_frame_bbox.keys()), tracked
+        video_path,
+        list(full_track_id_to_frame_bbox.keys()),
+        tracked,
+        student_id_to_frame_bbox=full_track_id_to_frame_bbox,
     )
-    _save_thumbnails(video_path, work_dir, tracked, list(sorted_ids))
+    _save_thumbnails(
+        video_path,
+        work_dir,
+        tracked,
+        list(sorted_ids),
+        student_id_to_frame_bbox=full_track_id_to_frame_bbox,
+    )
 
     return (
         rubric,
@@ -226,8 +242,9 @@ def _crop_frames_to_jpeg_bytes(
     video_path: Path,
     track_ids: List[str],
     tracked: List[TrackedDetection],
+    student_id_to_frame_bbox: Dict[str, TrackFrameBbox] | None = None,
 ) -> Dict[str, bytes]:
-    """Извлекает по одному кадру на трек и возвращает JPEG-байты для отображения в UI."""
+    """Извлекает по одному кадру на ученика (track_id или identity_id) и возвращает JPEG-байты."""
     out: Dict[str, bytes] = {}
     path_str = str(video_path.resolve())
     cap = cv2.VideoCapture(path_str)
@@ -235,14 +252,17 @@ def _crop_frames_to_jpeg_bytes(
         return out
     try:
         for sid in track_ids:
-            tid = int(sid) if (isinstance(sid, str) and sid.isdigit()) else None
-            if tid is None:
-                continue
-            dets = [(d.frame_index, d.bbox) for d in tracked if d.track_id == tid]
-            if not dets:
-                continue
-            mid = len(dets) // 2
-            frame_index, bbox = dets[mid]
+            if student_id_to_frame_bbox and sid in student_id_to_frame_bbox:
+                frame_index, bbox = student_id_to_frame_bbox[sid]
+            else:
+                tid = int(sid) if (isinstance(sid, str) and sid.isdigit()) else None
+                if tid is None:
+                    continue
+                dets = [(d.frame_index, d.bbox) for d in tracked if d.track_id == tid]
+                if not dets:
+                    continue
+                mid = len(dets) // 2
+                frame_index, bbox = dets[mid]
             frame = _read_frame_at(cap, frame_index)
             if frame is None:
                 continue
@@ -261,8 +281,9 @@ def _save_thumbnails(
     work_dir: Path,
     tracked: List[TrackedDetection],
     track_ids: List[str],
+    student_id_to_frame_bbox: Dict[str, TrackFrameBbox] | None = None,
 ) -> None:
-    """Сохраняет по одному кадру на трек в work_dir/thumbnails/{track_id}.jpg."""
+    """Сохраняет по одному кадру на ученика в work_dir/thumbnails/{student_id}.jpg."""
     thumb_dir = (work_dir / "thumbnails").resolve()
     thumb_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(video_path.resolve()))
@@ -270,14 +291,17 @@ def _save_thumbnails(
         return
     try:
         for sid in track_ids:
-            tid = int(sid) if (isinstance(sid, str) and sid.isdigit()) else None
-            if tid is None:
-                continue
-            dets = [(d.frame_index, d.bbox) for d in tracked if d.track_id == tid]
-            if not dets:
-                continue
-            mid = len(dets) // 2
-            frame_index, bbox = dets[mid]
+            if student_id_to_frame_bbox and sid in student_id_to_frame_bbox:
+                frame_index, bbox = student_id_to_frame_bbox[sid]
+            else:
+                tid = int(sid) if (isinstance(sid, str) and sid.isdigit()) else None
+                if tid is None:
+                    continue
+                dets = [(d.frame_index, d.bbox) for d in tracked if d.track_id == tid]
+                if not dets:
+                    continue
+                mid = len(dets) // 2
+                frame_index, bbox = dets[mid]
             frame = _read_frame_at(cap, frame_index)
             if frame is None:
                 continue
