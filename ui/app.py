@@ -118,6 +118,14 @@ def main() -> None:
             fallback_rgb = cv2.cvtColor(frame_fb, cv2.COLOR_BGR2RGB)
     cap_fallback.release()
 
+    # Якщо не удалось выделить ни одного ученика, аккуратно выходим.
+    if not features_by_student:
+        st.warning(
+            "Система не смогла надёжно отследить ни одного ученика на видео. "
+            "Попробуйте другое видео или уменьшите фильтр длины трека."
+        )
+        return
+
     # Кто есть кто: превью + ввод имени
     if "name_mapping" not in st.session_state:
         st.session_state["name_mapping"] = {}
