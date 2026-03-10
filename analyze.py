@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -14,12 +15,14 @@ from rubric import Rubric, load_rubric
 from scoring import StudentScores, score_students, score_students_model_based
 from video_processing import iter_frames, track_students_simple
 from video_processing.tracking import TrackedDetection
-from video_processing.video_features import compute_track_video_stats
+from video_processing.pose_events import build_video_segments_from_tracks
+from video_processing.emotion import estimate_facial_engagement_per_track
 
 
 def analyze_video(
     video_path: str | Path,
     work_dir: str | Path | None = None,
+    min_track_segments: int = 30,
 ) -> tuple[Rubric, Dict[str, StudentFeatures], Dict[str, StudentScores], Dict[str, str], Dict[str, TrackFrameBbox], Dict[str, bytes]]:
     """
     Полный анализ видео:
@@ -36,33 +39,8 @@ def analyze_video(
     frame_iter = iter_frames(video_path)
     tracked = track_students_simple(frame_iter)
 
-    # Базовые видео-признаки по трекам (движения, активность).
-    track_stats = compute_track_video_stats(tracked)
-
-    # Для MVP используем только идентификаторы треков как student_id
-    video_segments: List[VideoActivitySegment] = []
-    for det in tracked:
-        stats = track_stats.get(det.track_id)
-        is_off_task = False
-        if stats is not None:
-            # Очень грубая эвристика:
-            # - высокая общая активность + высокая боковая составляющая
-            #   может указывать на болтовню/движение по классу.
-            is_off_task = bool(
-                stats.motion_intensity > 0.7 and stats.lateral_motion_ratio > 0.6
-            )
-
-        video_segments.append(
-            VideoActivitySegment(
-                student_id=str(det.track_id),
-                start=det.timestamp,
-                end=det.timestamp,
-                is_hand_raised=False,
-                is_addressing_teacher=False,
-                is_addressing_class=False,
-                is_off_task=is_off_task,
-            )
-        )
+    # Видео-события: эвристики по трекам (поднятая рука, оффтоп и т.п.).
+    video_segments: List[VideoActivitySegment] = build_video_segments_from_tracks(tracked)
 
     # Аудио и ASR.
     audio_dir = work_dir / "audio"
@@ -81,24 +59,55 @@ def analyze_video(
         video_segments=video_segments,
     )
 
-    # Сильно ужесточаем фильтр: оставляем только 2 "самых заметных" трека,
-    # чтобы шумные короткие треки не превращались в лишних "учеников".
-    if len(student_features) > 2:
-        def importance(sf: StudentFeatures) -> float:
-            return (
-                sf.total_speaking_time
-                + sf.num_utterances * 2
-                + sf.hand_raise_count
-                + sf.address_class_count
-                + sf.address_teacher_count
-            )
+    # Оценка вовлечённости по мимике (если доступна модель FER).
+    # Используем те же кадры, что и для превью по трекам.
+    # Для экономии ресурсов берём по одному кадру на трек.
+    track_id_to_frame_bbox: Dict[str, TrackFrameBbox] = {}
+    for seg in video_segments:
+        # запомним один из кадров для каждого трека
+        if seg.student_id not in track_id_to_frame_bbox:
+            tid_int = int(seg.student_id) if seg.student_id.isdigit() else None
+            if tid_int is not None:
+                # найдём соответствующий detection
+                for d in tracked:
+                    if d.track_id == tid_int:
+                        track_id_to_frame_bbox[seg.student_id] = (d.frame_index, d.bbox)
+                        break
 
-        top_ids = sorted(
-            student_features.keys(),
-            key=lambda sid: importance(student_features[sid]),
-            reverse=True,
-        )[:2]
-        student_features = {sid: student_features[sid] for sid in top_ids}
+    # Предзагружаем несколько кадров по сохранённым индексам.
+    video_frames: List[Tuple[int, "cv2.Mat"]] = []
+    if track_id_to_frame_bbox:
+        cap_eng = cv2.VideoCapture(str(video_path.resolve()))
+        if cap_eng.isOpened():
+            try:
+                seen_indices = set()
+                for frame_index, _bbox in track_id_to_frame_bbox.values():
+                    if frame_index in seen_indices:
+                        continue
+                    seen_indices.add(frame_index)
+                    frame = _read_frame_at(cap_eng, frame_index)
+                    if frame is not None:
+                        video_frames.append((frame_index, frame))
+            finally:
+                cap_eng.release()
+
+    engagement_per_track = estimate_facial_engagement_per_track(
+        video_frames, track_id_to_frame_bbox
+    )
+
+    for sid, sf in student_features.items():
+        score = engagement_per_track.get(sid)
+        if score is not None:
+            sf.facial_engagement_score = score
+
+    # Отсекаем только шумные короткие треки: ученик должен быть виден минимум min_track_segments кадров
+    # (при 25 fps это ~1.2 с). Лимита на количество учеников нет — показываем всех, кто прошёл фильтр.
+    if min_track_segments > 0:
+        segment_counts = Counter(seg.student_id for seg in video_segments)
+        student_features = {
+            sid: sf for sid, sf in student_features.items()
+            if segment_counts.get(sid, 0) >= min_track_segments
+        }
 
     rubric = load_rubric()
     # Пытаемся использовать модельный скоринг, если обученные модели доступны.
@@ -115,21 +124,31 @@ def analyze_video(
 
     # Превью по трекам: кадр + JPEG-байты, чтобы в UI сразу показывать фото без открытия видео.
     label_to_track_id: Dict[str, str] = {id_to_label[sid]: sid for sid in sorted_ids}
-    track_id_to_frame_bbox: Dict[str, TrackFrameBbox] = {}
+    # используем уже собранные кадры для engagement; при отсутствии — рассчитываем как раньше
+    full_track_id_to_frame_bbox: Dict[str, TrackFrameBbox] = dict(track_id_to_frame_bbox)
     for sid in sorted_ids:
+        if sid in full_track_id_to_frame_bbox:
+            continue
         tid = int(sid) if (isinstance(sid, str) and sid.isdigit()) else None
         if tid is None:
             continue
         dets = [(d.frame_index, d.bbox) for d in tracked if d.track_id == tid]
         if dets:
             mid = len(dets) // 2
-            track_id_to_frame_bbox[sid] = dets[mid]
+            full_track_id_to_frame_bbox[sid] = dets[mid]
     track_id_to_image_bytes: Dict[str, bytes] = _crop_frames_to_jpeg_bytes(
-        video_path, list(track_id_to_frame_bbox.keys()), tracked
+        video_path, list(full_track_id_to_frame_bbox.keys()), tracked
     )
     _save_thumbnails(video_path, work_dir, tracked, list(sorted_ids))
 
-    return rubric, features_labeled, scores_labeled, label_to_track_id, track_id_to_frame_bbox, track_id_to_image_bytes
+    return (
+        rubric,
+        features_labeled,
+        scores_labeled,
+        label_to_track_id,
+        full_track_id_to_frame_bbox,
+        track_id_to_image_bytes,
+    )
 
 
 def _crop_to_face_or_person(frame: "cv2.Mat", bbox: Tuple[int, int, int, int], pad: int = 20) -> "cv2.Mat":

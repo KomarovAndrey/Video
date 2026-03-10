@@ -196,8 +196,36 @@ def main() -> None:
         selected_display = st.selectbox("Выберите ученика", options)
         selected = next(sid for sid in student_ids if display_names.get(sid, sid) == selected_display)
         feats = features_by_student[selected]
-        st.markdown("**Агрегированные признаки**")
-        st.json(feats.to_dict())
+        st.markdown("**Агрегированные признаки (аудио + видео)**")
+        feats_dict = feats.to_dict()
+
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.markdown("**Речь и взаимодействия**")
+            st.json(
+                {
+                    "total_speaking_time": feats_dict.get("total_speaking_time"),
+                    "num_utterances": feats_dict.get("num_utterances"),
+                    "num_questions": feats_dict.get("num_questions"),
+                    "num_ideas": feats_dict.get("num_ideas"),
+                    "num_disagreements": feats_dict.get("num_disagreements"),
+                    "num_supports": feats_dict.get("num_supports"),
+                    "num_off_task_events": feats_dict.get("num_off_task_events"),
+                }
+            )
+        with col_right:
+            st.markdown("**Видео-сигналы**")
+            st.json(
+                {
+                    "hand_raise_count": feats_dict.get("hand_raise_count"),
+                    "address_teacher_count": feats_dict.get("address_teacher_count"),
+                    "address_class_count": feats_dict.get("address_class_count"),
+                    "video_attention_score": feats_dict.get("video_attention_score"),
+                    "gesture_activity_score": feats_dict.get("gesture_activity_score"),
+                    "facial_engagement_score": feats_dict.get("facial_engagement_score"),
+                    "video_off_task_events": feats_dict.get("video_off_task_events"),
+                }
+            )
 
 
 if __name__ == "__main__":
