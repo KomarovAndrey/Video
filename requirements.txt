@@ -8,7 +8,7 @@ joblib
 numpy
 torch
 fer
-face-recognition
+# face-recognition (убрано: требовал dlib/cmake, теперь не нужен)
 
 opencv-contrib-python>=4.9.0
 numpy>=1.26.0
