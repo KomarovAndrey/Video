@@ -1,0 +1,10 @@
+opencv-contrib-python>=4.9.0
+numpy>=1.26.0
+torch>=2.2.0
+torchaudio>=2.2.0
+transformers>=4.40.0
+whisper-timestamped>=1.15.4
+ffmpeg-python>=0.2.0
+streamlit>=1.32.0
+pydantic>=2.6.0
+scikit-learn>=1.4.0
