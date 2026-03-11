@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 import sys
 
@@ -134,7 +135,11 @@ def main() -> None:
     thumb_dir = (work_dir / "thumbnails").resolve()
     thumb_dir.mkdir(parents=True, exist_ok=True)
     st.subheader("Кто есть кто")
-    st.caption("Посмотрите на фото и впишите имя человека. Имена появятся в таблице ниже.")
+    st.caption("Посмотрите на фото и впишите имя человека. Имена появятся в таблице ниже. Одинаковое имя у нескольких карточек объединит их в одну строку.")
+    ref_dir = work_dir / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    if not list(ref_dir.iterdir()):
+        st.caption("💡 Чтобы при следующем анализе сразу подставлялись имена: положите по одному фото в папки `data/references/Имя/` (например `data/references/Иван/photo.jpg`).")
     cols = st.columns(min(len(features_by_student), 5))
     for idx, label in enumerate(sorted(features_by_student.keys())):
         col = cols[idx % len(cols)]
@@ -182,14 +187,26 @@ def main() -> None:
             if new_name.strip():
                 name_mapping[label] = new_name.strip()
 
-    # Таблица с уровнями (с подставленными именами, если введены)
+    # Таблица с уровнями (с подставленными именами). Один человек = одна строка: при одном имени объединяем.
     display_names = {label: name_mapping.get(label, label) for label in scores_by_student}
-    rows = []
+    by_display_name: dict = defaultdict(list)
     for student_id, scores in scores_by_student.items():
-        row = {"Ученик": display_names.get(student_id, student_id)}
-        for criterion in rubric.criteria:
-            row[criterion.name] = scores.levels.get(criterion.id, 0)
-        rows.append(row)
+        name = display_names.get(student_id, student_id)
+        by_display_name[name].append((student_id, scores))
+    rows = []
+    for name, group in sorted(by_display_name.items(), key=lambda x: x[0]):
+        if len(group) == 1:
+            _, scores = group[0]
+            row = {"Ученик": name}
+            for criterion in rubric.criteria:
+                row[criterion.name] = scores.levels.get(criterion.id, 0)
+            rows.append(row)
+        else:
+            row = {"Ученик": name + " (объединённо)"}
+            for criterion in rubric.criteria:
+                vals = [s.levels.get(criterion.id, 0) for _, s in group]
+                row[criterion.name] = round(sum(vals) / len(vals))
+            rows.append(row)
 
     if rows:
         df = pd.DataFrame(rows)
@@ -215,15 +232,25 @@ def main() -> None:
                 st.json({k: round(v, 4) for k, v in top})
                 st.divider()
 
-    # Детализация по ученику (по отображаемому имени)
+    # Детализация по ученику (по отображаемому имени; при одном имени — объединённые признаки)
     student_ids = sorted(features_by_student.keys())
     if student_ids:
-        options = [display_names.get(sid, sid) for sid in student_ids]
+        options = list(dict.fromkeys(display_names.get(sid, sid) for sid in student_ids))
         selected_display = st.selectbox("Выберите ученика", options)
-        selected = next(sid for sid in student_ids if display_names.get(sid, sid) == selected_display)
-        feats = features_by_student[selected]
-        st.markdown("**Агрегированные признаки (аудио + видео)**")
-        feats_dict = feats.to_dict()
+        ids_with_name = [sid for sid in student_ids if display_names.get(sid, sid) == selected_display]
+        feats_list = [features_by_student[sid] for sid in ids_with_name]
+        if len(feats_list) == 1:
+            feats_dict = feats_list[0].to_dict()
+        else:
+            d0 = feats_list[0].to_dict()
+            feats_dict = {}
+            for k in d0:
+                vals = [f.to_dict().get(k, 0) for f in feats_list]
+                if "score" in k or k == "total_speaking_time":
+                    feats_dict[k] = sum(vals) / len(vals) if vals else 0
+                else:
+                    feats_dict[k] = sum(vals)
+        st.markdown("**Агрегированные признаки (аудио + видео)**" + (" (объединённо)" if len(ids_with_name) > 1 else ""))
 
         col_left, col_right = st.columns(2)
         with col_left:

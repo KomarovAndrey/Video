@@ -24,8 +24,8 @@ try:
 except AttributeError:
     _HAS_LBPH = False
 
-# Порог confidence LBPH: ниже = один человек (сливаем треки).
-LBPH_MERGE_THRESHOLD = 70
+# Порог confidence LBPH: ниже = один человек (сливаем треки). При дублях одного человека — поднять (например 80).
+LBPH_MERGE_THRESHOLD = 80
 # Сколько кадров максимум брать с одного трека для обучения/предсказания.
 MAX_FACES_PER_TRACK = 10
 # Минимальный размер лица для обучения.

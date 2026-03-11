@@ -25,8 +25,8 @@ try:
 except Exception:
     _HAS_INSIGHTFACE = False
 
-# Порог косинусной близости: выше = один человек (сливаем треки).
-INSIGHTFACE_MERGE_THRESHOLD = 0.45
+# Порог косинусной близости: выше = один человек (сливаем треки). 0.50–0.55: при дублях поднять.
+INSIGHTFACE_MERGE_THRESHOLD = 0.52
 # Сколько кадров максимум брать с одного трека для эмбеддингов.
 MAX_FACES_PER_TRACK = 10
 # Минимальная сторона кропа для InsightFace.
