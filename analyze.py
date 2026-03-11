@@ -10,14 +10,35 @@ TrackFrameBbox = Tuple[int, Tuple[int, int, int, int]]
 import cv2
 
 from audio_processing import extract_audio_to_wav, transcribe_audio_to_utterances
+from audio_processing.diarization import (
+    assign_utterances_to_speakers,
+    diarize_audio,
+    map_speakers_to_identities,
+    speaker_order_from_segments,
+)
 from features import StudentFeatures, Utterance, VideoActivitySegment, aggregate_student_features
 from rubric import Rubric, load_rubric
 from scoring import StudentScores, score_students, score_students_model_based
 from video_processing import iter_frames, track_students_simple
 from video_processing.tracking import TrackedDetection
 from video_processing.pose_events import build_video_segments_from_tracks
-from video_processing.emotion import estimate_facial_engagement_per_track
+from video_processing.emotion import estimate_facial_engagement_per_identity
 from video_processing.identity_lbph import get_track_id_to_identity_lbph
+from video_processing.identity_insightface import get_track_id_to_identity_insightface
+
+
+def _get_track_id_to_identity(
+    video_path: Path,
+    work_dir: Path,
+    tracked: List[TrackedDetection],
+) -> Dict[int, str]:
+    """Гибрид: InsightFace при доступности, иначе LBPH."""
+    result = get_track_id_to_identity_insightface(
+        video_path, tracked, work_dir=work_dir
+    )
+    if result is not None:
+        return result
+    return get_track_id_to_identity_lbph(video_path, tracked)
 
 
 def analyze_video(
@@ -40,10 +61,9 @@ def analyze_video(
     frame_iter = iter_frames(video_path)
     tracked = track_students_simple(frame_iter)
 
-    # Слияние треков по лицу (LBPH, без dlib): один человек = один identity_id.
-    track_id_to_identity: Dict[int, str] = get_track_id_to_identity_lbph(
-        video_path,
-        tracked,
+    # Слияние треков по лицу: InsightFace при установке, иначе LBPH.
+    track_id_to_identity = _get_track_id_to_identity(
+        video_path, work_dir, tracked
     )
 
     # Видео-события: эвристики по трекам (поднятая рука, оффтоп). student_id = identity_id.
@@ -56,12 +76,18 @@ def analyze_video(
     audio_path = extract_audio_to_wav(video_path, audio_dir)
     utterances: List[Utterance] = transcribe_audio_to_utterances(audio_path)
 
-    # Пока реплики не привязаны к конкретным ученикам: распределить их
-    # равномерно по имеющимся track_id (очень грубая эвристика).
+    # Привязка реплик к ученикам: диарзация при доступности, иначе round-robin.
     unique_track_ids = sorted({seg.student_id for seg in video_segments}) or ["unknown"]
-    for idx, utt in enumerate(utterances):
-        assigned_student = unique_track_ids[idx % len(unique_track_ids)]
-        utt.student_id = assigned_student
+    diar_segments = diarize_audio(audio_path)
+    assign_utterances_to_speakers(utterances, diar_segments)
+    if diar_segments:
+        speaker_order = speaker_order_from_segments(diar_segments)
+        speaker_to_identity = map_speakers_to_identities(speaker_order, unique_track_ids)
+        for utt in utterances:
+            utt.student_id = speaker_to_identity.get(utt.student_id, unique_track_ids[0])
+    else:
+        for idx, utt in enumerate(utterances):
+            utt.student_id = unique_track_ids[idx % len(unique_track_ids)]
 
     student_features: Dict[str, StudentFeatures] = aggregate_student_features(
         utterances=utterances,
@@ -74,39 +100,26 @@ def analyze_video(
     for tid, iid in track_id_to_identity.items():
         identity_to_track_ids[iid].append(tid)
     for identity_id, tids in identity_to_track_ids.items():
-        # выбираем трек с максимальным числом детекций
         best_tid = max(tids, key=lambda t: sum(1 for d in tracked if d.track_id == t))
         for d in tracked:
             if d.track_id == best_tid:
                 identity_id_to_frame_bbox[identity_id] = (d.frame_index, d.bbox)
                 break
 
-    # Оценка вовлечённости по мимике (если доступна модель FER).
-    track_id_to_frame_bbox = identity_id_to_frame_bbox
-
-    # Предзагружаем несколько кадров по сохранённым индексам.
-    video_frames: List[Tuple[int, "cv2.Mat"]] = []
-    if track_id_to_frame_bbox:
-        cap_eng = cv2.VideoCapture(str(video_path.resolve()))
-        if cap_eng.isOpened():
-            try:
-                seen_indices = set()
-                for frame_index, _bbox in track_id_to_frame_bbox.values():
-                    if frame_index in seen_indices:
-                        continue
-                    seen_indices.add(frame_index)
-                    frame = _read_frame_at(cap_eng, frame_index)
-                    if frame is not None:
-                        video_frames.append((frame_index, frame))
-            finally:
-                cap_eng.release()
-
-    engagement_per_track = estimate_facial_engagement_per_track(
-        video_frames, track_id_to_frame_bbox
+    # Многокадровая оценка вовлечённости (мимика + head pose) по каждому identity.
+    identity_to_frame_bboxes: Dict[str, List[Tuple[int, Tuple[int, int, int, int]]]] = defaultdict(list)
+    for d in tracked:
+        iid = track_id_to_identity.get(d.track_id, str(d.track_id))
+        identity_to_frame_bboxes[iid].append((d.frame_index, d.bbox))
+    engagement_per_identity = estimate_facial_engagement_per_identity(
+        video_path,
+        dict(identity_to_frame_bboxes),
+        max_frames_per_identity=15,
+        head_pose_weight=0.4,
     )
 
     for sid, sf in student_features.items():
-        score = engagement_per_track.get(sid)
+        score = engagement_per_identity.get(sid)
         if score is not None:
             sf.facial_engagement_score = score
 

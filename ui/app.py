@@ -14,6 +14,7 @@ import cv2
 
 from analyze import analyze_video, generate_preview_frames
 from rubric import load_rubric
+from scoring import get_criterion_feature_importances
 
 
 def main() -> None:
@@ -196,6 +197,23 @@ def main() -> None:
         df.index.name = "№"
         st.subheader("Уровни по критериям")
         st.dataframe(df, use_container_width=True)
+
+    # Влияние признаков на оценки (если есть обученные модели и metadata)
+    importances = get_criterion_feature_importances()
+    if importances:
+        with st.expander("Влияние признаков на оценки"):
+            st.caption(
+                "Топ признаков по важности для каждой модели. Полезно для интерпретации и калибровки."
+            )
+            id_to_name = {c.id: c.name for c in rubric.criteria}
+            for crit_id, feat_imp in importances.items():
+                if not feat_imp:
+                    continue
+                name = id_to_name.get(crit_id, crit_id)
+                top = sorted(feat_imp.items(), key=lambda x: -x[1])[:10]
+                st.markdown(f"**{name}**")
+                st.json({k: round(v, 4) for k, v in top})
+                st.divider()
 
     # Детализация по ученику (по отображаемому имени)
     student_ids = sorted(features_by_student.keys())

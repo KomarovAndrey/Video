@@ -17,8 +17,9 @@ from __future__ import annotations
 из scoring.rule_based в качестве fallback.
 """
 
+import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import joblib
 
@@ -33,13 +34,21 @@ from .rule_based import (
     _score_self_regulation,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODELS_DIR = PROJECT_ROOT / "models"
+_DEFAULT_MODELS_DIR = PROJECT_ROOT / "models"
+
+
+def get_models_dir() -> Path:
+    """Каталог моделей: SCORER_MODELS_DIR или models/ в корне проекта."""
+    env = os.environ.get("SCORER_MODELS_DIR")
+    if env:
+        return Path(env)
+    return _DEFAULT_MODELS_DIR
 
 
 def _load_model(name: str):
-    path = MODELS_DIR / f"scorer_{name}.joblib"
+    models_dir = get_models_dir()
+    path = models_dir / f"scorer_{name}.joblib"
     if not path.exists():
         return None
     try:
@@ -47,6 +56,22 @@ def _load_model(name: str):
     except Exception:
         return None
 
+
+def _load_feature_columns() -> List[str] | None:
+    meta_path = get_models_dir() / "metadata.json"
+    if not meta_path.exists():
+        return None
+    try:
+        import json
+
+        with open(meta_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("feature_columns")
+    except Exception:
+        return None
+
+
+MODELS_DIR = _DEFAULT_MODELS_DIR
 
 _MODEL_COMMUNICATION = _load_model("communication")
 _MODEL_LEADERSHIP = _load_model("leadership")
@@ -69,13 +94,15 @@ def _predict_level(model, f: StudentFeatures, fallback_fn) -> int:
         return fallback_fn(f)
     try:
         x = _features_to_vector(f)
-        # Ожидаем, что модель умеет работать с dict или с упорядоченным списком признаков.
-        # Базовая реализация рассчитывает по отсортированным ключам.
         if hasattr(model, "predict_dict"):
             pred = model.predict_dict(x)[0]
         else:
-            keys = sorted(x.keys())
-            vec = [[x[k] for k in keys]]
+            feature_cols = _load_feature_columns()
+            if feature_cols:
+                vec = [[x.get(k, 0.0) for k in feature_cols]]
+            else:
+                keys = sorted(x.keys())
+                vec = [[x[k] for k in keys]]
             pred = model.predict(vec)[0]
         level = int(round(float(pred)))
         return max(1, min(5, level))
@@ -113,5 +140,32 @@ def score_students_model_based(
     return scores
 
 
-__all__ = ["score_students_model_based"]
+def get_criterion_feature_importances() -> Dict[str, Dict[str, float]]:
+    """
+    Возвращает важность признаков по каждому критерию для интерпретации оценок.
+    Ключ — criterion_id, значение — словарь {имя_признака: важность}.
+    Если модели или metadata отсутствуют, возвращается пустой словарь.
+    """
+    feature_cols = _load_feature_columns()
+    if not feature_cols:
+        return {}
+    models_dir = get_models_dir()
+    result: Dict[str, Dict[str, float]] = {}
+    for crit in ("communication", "leadership", "self_regulation", "self_reflection", "critical_thinking"):
+        path = models_dir / f"scorer_{crit}.joblib"
+        if not path.exists():
+            continue
+        try:
+            model = joblib.load(path)
+            imp = getattr(model, "feature_importances_", None)
+            if imp is not None and len(imp) == len(feature_cols):
+                result[crit] = {name: float(imp[i]) for i, name in enumerate(feature_cols)}
+            else:
+                result[crit] = {}
+        except Exception:
+            continue
+    return result
+
+
+__all__ = ["score_students_model_based", "get_criterion_feature_importances", "get_models_dir"]
 
